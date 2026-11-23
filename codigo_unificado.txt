@@ -1,0 +1,2197 @@
+================================================================================
+ARQUIVO: lstm_gates.py
+================================================================================
+
+import copy
+import itertools
+from typing import Any, Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+
+
+class ExplicitLSTMCell(nn.Module):
+    """Implementação explícita de uma célula LSTM com gates e Cell State."""
+
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        # Projeções lineares para [x_t, h_{t-1}] -> 4 * hidden_size
+        # Ordem dos 4 blocos: forget (f), input (i), cell candidate (g/c_tilde), output (o)
+        self.x2h = nn.Linear(input_size, 4 * hidden_size)
+        self.h2h = nn.Linear(hidden_size, 4 * hidden_size)
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        h_prev: torch.Tensor,
+        c_prev: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        gates = self.x2h(x_t) + self.h2h(h_prev)
+        f_gate, i_gate, c_tilde, o_gate = gates.chunk(4, dim=-1)
+
+        f_t = torch.sigmoid(f_gate)      # Forget gate: o que descartar de c_prev
+        i_t = torch.sigmoid(i_gate)      # Input gate: o quanto inserir de c_tilde
+        g_t = torch.tanh(c_tilde)        # Candidata ao novo estado da célula
+        o_t = torch.sigmoid(o_gate)      # Output gate: o que expor em h_t
+
+        c_t = f_t * c_prev + i_t * g_t   # Novo Cell State
+        h_t = o_t * torch.tanh(c_t)      # Novo estado oculto
+
+        return h_t, c_t
+
+
+class SequenceLSTMClassifier(nn.Module):
+    """Classificador de sequências usando células LSTM explícitas."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_classes: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.cell = ExplicitLSTMCell(input_size, hidden_size)
+        self.fc_out = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x tem formato (batch_size, seq_len, input_size)
+        batch_size, seq_len, _ = x.shape
+        h_t = torch.zeros(batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
+        c_t = torch.zeros(batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
+
+        for t in range(seq_len):
+            h_t, c_t = self.cell(x[:, t, :], h_t, c_t)
+
+        # Usa o último estado oculto h_t para mapear às classes
+        logits = self.fc_out(h_t)
+        return logits
+
+
+def evaluate_loss(
+    model: nn.Module,
+    x_val: torch.Tensor,
+    y_val: torch.Tensor,
+    criterion: nn.Module,
+) -> float:
+    model.eval()
+    with torch.no_grad():
+        logits = model(x_val)
+        loss = criterion(logits, y_val)
+    return float(loss.item())
+
+
+def grid_search_lstm(
+    param_grid: Dict[str, List[Any]],
+    x_train: torch.Tensor,
+    y_train: torch.Tensor,
+    x_val: torch.Tensor,
+    y_val: torch.Tensor,
+    input_size: int,
+    num_classes: int,
+    epochs: int = 15,
+    seed: int = 42,
+) -> Tuple[Dict[str, Any], nn.Module, List[Tuple[Dict[str, Any], float]]]:
+    """Explora sistematicamente todas as combinações da grade de hiperparâmetros."""
+    keys = list(param_grid.keys())
+    value_lists = [param_grid[k] for k in keys]
+    criterion = nn.CrossEntropyLoss()
+
+    results: List[Tuple[Dict[str, Any], float]] = []
+    best_params: Dict[str, Any] = {}
+    best_val_loss = float("inf")
+    best_model: nn.Module | None = None
+
+    for idx, combo in enumerate(itertools.product(*value_lists), start=1):
+        params = dict(zip(keys, combo))
+        torch.manual_seed(seed)
+
+        model = SequenceLSTMClassifier(
+            input_size=input_size,
+            hidden_size=params["hidden_size"],
+            num_classes=num_classes,
+        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"])
+
+        for _ in range(epochs):
+            model.train()
+            optimizer.zero_grad()
+            logits = model(x_train)
+            loss = criterion(logits, y_train)
+            loss.backward()
+            optimizer.step()
+
+        val_loss = evaluate_loss(model, x_val, y_val, criterion)
+        results.append((params, val_loss))
+        print(f"[{idx:02d}] params={params} -> val_loss={val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_params = params
+            best_model = copy.deepcopy(model)
+
+    assert best_model is not None
+    return best_params, best_model, results
+
+
+def main() -> None:
+    torch.manual_seed(42)
+
+    seq_len = 12
+    input_size = 6
+    num_classes = 3
+
+    # Dados sintéticos de treino e validação
+    x_train = torch.randn(32, seq_len, input_size)
+    y_train = torch.randint(0, num_classes, (32,))
+    x_val = torch.randn(16, seq_len, input_size)
+    y_val = torch.randint(0, num_classes, (16,))
+
+    # Grade de hiperparâmetros para busca exaustiva
+    param_grid = {
+        "hidden_size": [16, 32],
+        "lr": [1e-2, 5e-3, 1e-3],
+        "epochs": [15],
+    }
+
+    # Mantém apenas chaves de modelo/otimizador na grade de busca
+    search_grid = {
+        "hidden_size": param_grid["hidden_size"],
+        "lr": param_grid["lr"],
+    }
+    epochs = param_grid["epochs"][0]
+
+    print("Iniciando Grid Search...\n")
+    best_params, best_model, all_results = grid_search_lstm(
+        param_grid=search_grid,
+        x_train=x_train,
+        y_train=y_train,
+        x_val=x_val,
+        y_val=y_val,
+        input_size=input_size,
+        num_classes=num_classes,
+        epochs=epochs,
+        seed=42,
+    )
+
+    best_loss = min(loss for _, loss in all_results)
+    print("\n--- Resultado do Grid Search ---")
+    print(f"Total de combinações avaliadas: {len(all_results)}")
+    print(f"Melhores hiperparâmetros: {best_params}")
+    print(f"Menor val_loss: {best_loss:.4f}")
+
+    # Inferência com o melhor modelo encontrado
+    best_model.eval()
+    sample = torch.randn(1, seq_len, input_size)
+    with torch.no_grad():
+        probs = torch.softmax(best_model(sample), dim=-1)
+    print(f"Probabilidades previstas na amostra: {[round(p, 4) for p in probs[0].tolist()]}")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: umap_hdbscan_emails.py
+================================================================================
+
+from typing import List, Tuple
+
+import hdbscan
+import numpy as np
+from sklearn.metrics.pairwise import cosine_distances
+import umap
+
+
+def generate_mock_email_embeddings(
+    n_per_cluster: int = 45,
+    n_noise: int = 15,
+    dim: int = 768,
+    seed: int = 42,
+) -> Tuple[np.ndarray, List[str], np.ndarray]:
+    """
+    Gera embeddings sintéticos de 768 dimensões para e-mails de atendimento
+    divididos em 3 temas principais + e-mails atípicos/ruído.
+    """
+    rng = np.random.default_rng(seed)
+
+    topics = {
+        0: "Cobrança / Fatura / Boleto",
+        1: "Acesso / Senha / Autenticação",
+        2: "Prazo / Entrega / Status do Pedido",
+    }
+
+    embeddings_list: List[np.ndarray] = []
+    labels_true: List[int] = []
+
+    for topic_id in topics:
+        # Protótipo base em 768D + ruído isotrópico de alta dimensionalidade
+        center = rng.normal(0.0, 0.25, size=(1, dim))
+        cluster_vecs = center + rng.normal(0.0, 0.45, size=(n_per_cluster, dim))
+        embeddings_list.append(cluster_vecs)
+        labels_true.extend([topic_id] * n_per_cluster)
+
+    if n_noise > 0:
+        noise_vecs = rng.normal(0.0, 0.85, size=(n_noise, dim))
+        embeddings_list.append(noise_vecs)
+        labels_true.extend([-1] * n_noise)
+
+    x_emb = np.vstack(embeddings_list).astype(np.float32)
+    y_true = np.asarray(labels_true, dtype=np.int32)
+
+    perm = rng.permutation(len(x_emb))
+    return x_emb[perm], [topics.get(int(lbl), "Ruído / Atípico") for lbl in y_true[perm]], y_true[perm]
+
+
+def main() -> None:
+    x_768d, _, y_true = generate_mock_email_embeddings(
+        n_per_cluster=45, n_noise=15, dim=768, seed=42
+    )
+
+    # Mostra como distâncias euclidianas brutas em 768D tendem a ficar concentradas
+    raw_dists = cosine_distances(x_768d[:50])
+    off_diag = raw_dists[~np.eye(50, dtype=bool)]
+    print(f"Total de e-mails avaliados: {len(x_768d)} | Dimensão original: {x_768d.shape[1]}")
+    print(
+        f"Distância cosseno bruta (768D) -> média: {off_diag.mean():.4f} | "
+        f"desvio: {off_diag.std():.4f} | min-max: [{off_diag.min():.4f}, {off_diag.max():.4f}]\n"
+    )
+
+    # 1. Redução de dimensionalidade com UMAP (768D -> 10D)
+    reducer = umap.UMAP(
+        n_components=10,
+        n_neighbors=15,
+        min_dist=0.05,
+        metric="cosine",
+        random_state=42,
+    )
+    x_umap = reducer.fit_transform(x_768d)
+
+    # 2. Agrupamento hierárquico baseado em densidade com HDBSCAN
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=15,
+        min_samples=5,
+        metric="euclidean",
+    )
+    cluster_labels = clusterer.fit_predict(x_umap)
+
+    unique_clusters, counts = np.unique(cluster_labels, return_counts=True)
+    print("=== Clusters encontrados (UMAP -> HDBSCAN) ===")
+    for cid, cnt in zip(unique_clusters, counts):
+        nome = "Ruído / Não agrupado (-1)" if cid == -1 else f"Cluster {cid}"
+        print(f"  {nome:<28}: {cnt} e-mails")
+
+    # Resumo de probabilidade de pertinência ao cluster (0.0 para ruído)
+    non_noise_mask = cluster_labels != -1
+    if np.any(non_noise_mask):
+        avg_prob = float(clusterer.probabilities_[non_noise_mask].mean())
+        print(f"\nConfiança média nos clusters válidos: {avg_prob:.4f}")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: td3_robot_arm.py
+================================================================================
+
+import copy
+from dataclasses import dataclass
+from typing import Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class TwoLinkArmEnv:
+    """Ambiente simples de braço robótico planar de 2 juntas (ações contínuas em [-1, 1])."""
+
+    def __init__(self, max_steps: int = 100, dt: float = 0.05):
+        self.max_steps = max_steps
+        self.dt = dt
+        self.link_lengths = np.array([1.0, 0.8], dtype=np.float32)
+        self.state_dim = 6  # [q1, q2, dq1, dq2, target_x, target_y]
+        self.action_dim = 2  # [torque_1, torque_2] normalizados em [-1, 1]
+        self.max_torque = 2.0
+        self.state = np.zeros(self.state_dim, dtype=np.float32)
+        self.steps = 0
+
+    def _end_effector_pos(self, q1: float, q2: float) -> Tuple[float, float]:
+        l1, l2 = self.link_lengths
+        x = l1 * np.cos(q1) + l2 * np.cos(q1 + q2)
+        y = l1 * np.sin(q1) + l2 * np.sin(q1 + q2)
+        return float(x), float(y)
+
+    def reset(self, rng: np.random.Generator) -> np.ndarray:
+        q = rng.uniform(-np.pi, np.pi, size=2).astype(np.float32)
+        dq = np.zeros(2, dtype=np.float32)
+        # Alvo dentro do alcance máximo (1.8) e mínimo (0.2)
+        angle = rng.uniform(-np.pi, np.pi)
+        radius = rng.uniform(0.3, 1.6)
+        target = np.array(
+            [radius * np.cos(angle), radius * np.sin(angle)], dtype=np.float32
+        )
+        self.state = np.concatenate([q, dq, target]).astype(np.float32)
+        self.steps = 0
+        return self.state.copy()
+
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool]:
+        self.steps += 1
+        clipped_action = np.clip(action, -1.0, 1.0).astype(np.float32)
+        torques = clipped_action * self.max_torque
+
+        q1, q2, dq1, dq2, tx, ty = self.state
+        damping = 0.25
+
+        # Dinâmica simplificada de segunda ordem com amortecimento
+        ddq1 = torques[0] - damping * dq1
+        ddq2 = torques[1] - damping * dq2
+
+        dq1 = float(np.clip(dq1 + ddq1 * self.dt, -5.0, 5.0))
+        dq2 = float(np.clip(dq2 + ddq2 * self.dt, -5.0, 5.0))
+        q1 = float(((q1 + dq1 * self.dt + np.pi) % (2 * np.pi)) - np.pi)
+        q2 = float(((q2 + dq2 * self.dt + np.pi) % (2 * np.pi)) - np.pi)
+
+        ex, ey = self._end_effector_pos(q1, q2)
+        dist = float(np.hypot(tx - ex, ty - ey))
+
+        # Recompensa negativa pela distância ao alvo + pequena penalidade de esforço
+        effort_penalty = 0.01 * float(np.sum(clipped_action**2))
+        reward = -dist - effort_penalty
+        if dist < 0.08:
+            reward += 2.0
+
+        done = self.steps >= self.max_steps
+        self.state = np.array([q1, q2, dq1, dq2, tx, ty], dtype=np.float32)
+        return self.state.copy(), reward, done
+
+
+class ReplayBuffer:
+    def __init__(self, state_dim: int, action_dim: int, capacity: int = 50_000):
+        self.capacity = capacity
+        self.ptr = 0
+        self.size = 0
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.rewards = np.zeros((capacity, 1), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros((capacity, 1), dtype=np.float32)
+
+    def add(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
+        self.states[self.ptr] = state
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.next_states[self.ptr] = next_state
+        self.dones[self.ptr] = float(done)
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(
+        self, batch_size: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        idx = np.random.randint(0, self.size, size=batch_size)
+        return (
+            torch.as_tensor(self.states[idx], device=device),
+            torch.as_tensor(self.actions[idx], device=device),
+            torch.as_tensor(self.rewards[idx], device=device),
+            torch.as_tensor(self.next_states[idx], device=device),
+            torch.as_tensor(self.dones[idx], device=device),
+        )
+
+
+class Actor(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Tanh(),  # Saída contínua em [-1, 1]
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.net(state)
+
+
+class Critic(nn.Module):
+    """Duas redes Q (Q1 e Q2) para reduzir superestimação no TD3."""
+
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        in_dim = state_dim + action_dim
+        self.q1 = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.q2 = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self, state: torch.Tensor, action: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sa = torch.cat([state, action], dim=1)
+        return self.q1(sa), self.q2(sa)
+
+    def q1_only(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return self.q1(torch.cat([state, action], dim=1))
+
+
+@dataclass
+class TD3Config:
+    gamma: float = 0.99
+    tau: float = 0.005
+    policy_noise: float = 0.2
+    noise_clip: float = 0.5
+    policy_freq: int = 2
+    exploration_noise: float = 0.15
+    batch_size: int = 128
+    lr: float = 1e-3
+
+
+class TD3Agent:
+    def __init__(self, state_dim: int, action_dim: int, cfg: TD3Config, device: torch.device):
+        self.cfg = cfg
+        self.device = device
+        self.total_it = 0
+
+        self.actor = Actor(state_dim, action_dim).to(device)
+        self.actor_target = copy.deepcopy(self.actor)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
+
+        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic_target = copy.deepcopy(self.critic)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
+
+    def select_action(self, state: np.ndarray, noise_std: float = 0.0) -> np.ndarray:
+        state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            action = self.actor(state_t).squeeze(0).cpu().numpy()
+        if noise_std > 0.0:
+            action = action + np.random.normal(0.0, noise_std, size=action.shape)
+        return np.clip(action, -1.0, 1.0).astype(np.float32)
+
+    def train_step(self, buffer: ReplayBuffer) -> None:
+        if buffer.size < self.cfg.batch_size:
+            return
+
+        self.total_it += 1
+        state, action, reward, next_state, done = buffer.sample(
+            self.cfg.batch_size, self.device
+        )
+
+        with torch.no_grad():
+            # 1. Target policy smoothing (ruído limitado na ação alvo)
+            noise = (torch.randn_like(action) * self.cfg.policy_noise).clamp(
+                -self.cfg.noise_clip, self.cfg.noise_clip
+            )
+            next_action = (self.actor_target(next_state) + noise).clamp(-1.0, 1.0)
+
+            # 2. Clipped double Q-learning (mínimo entre Q1 e Q2 alvo)
+            target_q1, target_q2 = self.critic_target(next_state, next_action)
+            target_q = torch.min(target_q1, target_q2)
+            target_q = reward + (1.0 - done) * self.cfg.gamma * target_q
+
+        # Atualiza redes críticas
+        current_q1, current_q2 = self.critic(state, action)
+        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        self.critic_opt.step()
+
+        # 3. Atualização atrasada do ator e das redes-alvo
+        if self.total_it % self.cfg.policy_freq == 0:
+            actor_loss = -self.critic.q1_only(state, self.actor(state)).mean()
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            self.actor_opt.step()
+
+            for param, target_param in zip(
+                self.critic.parameters(), self.critic_target.parameters()
+            ):
+                target_param.data.copy_(
+                    self.cfg.tau * param.data + (1.0 - self.cfg.tau) * target_param.data
+                )
+
+            for param, target_param in zip(
+                self.actor.parameters(), self.actor_target.parameters()
+            ):
+                target_param.data.copy_(
+                    self.cfg.tau * param.data + (1.0 - self.cfg.tau) * target_param.data
+                )
+
+
+def main() -> None:
+    rng = np.random.default_rng(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    env = TwoLinkArmEnv(max_steps=80)
+    cfg = TD3Config()
+    agent = TD3Agent(env.state_dim, env.action_dim, cfg, device)
+    buffer = ReplayBuffer(env.state_dim, env.action_dim)
+
+    episodes = 120
+    warmup_steps = 500
+    step_count = 0
+
+    for ep in range(1, episodes + 1):
+        state = env.reset(rng)
+        ep_reward = 0.0
+        done = False
+
+        while not done:
+            step_count += 1
+            if step_count < warmup_steps:
+                action = rng.uniform(-1.0, 1.0, size=env.action_dim).astype(np.float32)
+            else:
+                action = agent.select_action(state, noise_std=cfg.exploration_noise)
+
+            next_state, reward, done = env.step(action)
+            buffer.add(state, action, reward, next_state, done)
+            agent.train_step(buffer)
+
+            state = next_state
+            ep_reward += reward
+
+        if ep % 20 == 0 or ep == 1:
+            print(f"Episódio {ep:3d}/{episodes} | Recompensa acumulada: {ep_reward:7.2f}")
+
+    # Avaliação final sem ruído de exploração
+    eval_state = env.reset(rng)
+    eval_action = agent.select_action(eval_state, noise_std=0.0)
+    print(f"\nAção prevista pelo ator para o estado inicial: {eval_action}")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: net.py
+================================================================================
+
+import torch
+from torch import Tensor, nn
+
+
+class CVMNet(nn.Module):
+    def __init__(self, dim_in: int, dim_hidden: int, n_classes: int):
+        super().__init__()
+        self.i_layer = nn.Linear(dim_in, dim_hidden)
+        self.h_layer = nn.Sequential(
+            nn.Linear(dim_hidden, dim_hidden // 2),
+            nn.Tanh(),
+        )
+        self.o_layer = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(dim_hidden // 2, n_classes),
+            nn.Softmax(dim=-1),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.o_layer(self.h_layer(self.i_layer(x)))
+
+
+def main() -> None:
+    torch.manual_seed(42)
+
+    model = CVMNet(dim_in=400, dim_hidden=100, n_classes=3)
+    x_input = torch.eye(20).flatten()  # tensor 1D de tamanho 400 (20 * 20)
+
+    pred = model(x_input).detach()
+
+    print(f"Formato (shape) de pred : {tuple(pred.shape)}")
+    print(f"Valores de pred        : {[round(float(v), 6) for v in pred]}")
+    print(f"Soma dos valores       : {float(pred.sum()):.6f}")
+    print(f"requires_grad          : {pred.requires_grad}")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: isolation_forest_network.py
+================================================================================
+
+import numpy as np
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import classification_report
+
+
+def generate_network_traffic(
+    n_normal: int = 950,
+    n_anomalies: int = 50,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Gera features sintéticas de tráfego de rede:
+    [bytes_transferred, packets_per_sec, duration_sec, unique_ports]
+    Rótulos: 1 = normal, -1 = anomalia (padrão do scikit-learn).
+    """
+    rng = np.random.default_rng(seed)
+
+    normal_traffic = np.column_stack(
+        [
+            rng.normal(loc=5000.0, scale=1200.0, size=n_normal),   # bytes
+            rng.normal(loc=40.0, scale=10.0, size=n_normal),        # pacotes/s
+            rng.normal(loc=2.5, scale=0.8, size=n_normal),          # duração (s)
+            rng.integers(1, 6, size=n_normal),                      # portas únicas
+        ]
+    )
+
+    # Anomalias: exfiltração massiva, varredura de portas ou rajadas atípicas
+    anomalous_traffic = np.column_stack(
+        [
+            rng.normal(loc=45000.0, scale=8000.0, size=n_anomalies),
+            rng.normal(loc=320.0, scale=60.0, size=n_anomalies),
+            rng.normal(loc=35.0, scale=10.0, size=n_anomalies),
+            rng.integers(25, 80, size=n_anomalies),
+        ]
+    )
+
+    x = np.vstack([normal_traffic, anomalous_traffic]).astype(np.float32)
+    y_true = np.array([1] * n_normal + [-1] * n_anomalies, dtype=np.int32)
+
+    perm = rng.permutation(len(x))
+    return x[perm], y_true[perm]
+
+
+def main() -> None:
+    x_data, y_true = generate_network_traffic()
+
+    # contamination define a proporção estimada de anomalias no dataset
+    model = IsolationForest(
+        n_estimators=200,
+        contamination=0.05,
+        random_state=42,
+    )
+
+    # Predição: 1 (normal) e -1 (anomalia)
+    y_pred = model.fit_predict(x_data)
+
+    # decision_function: valores negativos indicam maior grau de anomalia
+    anomaly_scores = model.decision_function(x_data)
+
+    print("Relatório de detecção (1 = normal, -1 = anomalia):\n")
+    print(classification_report(y_true, y_pred, target_names=["Anomalia (-1)", "Normal (1)"]))
+
+    # Exibe os 5 registros mais suspeitos (menores scores)
+    top_suspicious_idx = np.argsort(anomaly_scores)[:5]
+    print("Top 5 conexões mais anômalas:")
+    for rank, idx in enumerate(top_suspicious_idx, start=1):
+        b, pps, dur, ports = x_data[idx]
+        print(
+            f"  {rank}. score={anomaly_scores[idx]:+.4f} | pred={y_pred[idx]:+d} | "
+            f"bytes={b:.0f}, pps={pps:.1f}, dur={dur:.1f}s, ports={ports:.0f}"
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: monitoramento_data_drift.py
+================================================================================
+
+from typing import Dict, Tuple
+
+import numpy as np
+from scipy.stats import ks_2samp
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import precision_score
+
+
+def sample_truncated_normal_1_to_10(
+    rng: np.random.Generator,
+    mean: float,
+    std: float,
+    size: int,
+) -> np.ndarray:
+    """Amostra valores reais limitados ao intervalo [1.0, 10.0] com média/desvio alvo."""
+    values = rng.normal(loc=mean, scale=std, size=size * 2)
+    clipped = np.clip(values, 1.0, 10.0)
+    # Ajusta levemente o deslocamento para aproximar os momentos desejados no intervalo [1, 10]
+    chosen = rng.choice(clipped, size=size, replace=False)
+    return chosen.astype(np.float32)
+
+
+def generate_drift_sheets(
+    n_train: int = 800,
+    n_prod: int = 400,
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Gera matrizes de planilhas com 4 colunas reais em [1, 10], sendo as 2 primeiras
+    as colunas importantes monitoradas no enunciado:
+      - Treino/Teste: média ~4.89 e desvio padrão ~3.08 nas 2 colunas principais
+      - Operação atual (drift): média ~5.34 e desvio padrão ~3.68 nas 2 colunas principais
+    """
+    rng = np.random.default_rng(seed)
+
+    # Conjunto de treino e teste (distribuição original)
+    col1_train = sample_truncated_normal_1_to_10(rng, mean=4.89, std=3.08, size=n_train)
+    col2_train = sample_truncated_normal_1_to_10(rng, mean=4.89, std=3.08, size=n_train)
+    col3_train = sample_truncated_normal_1_to_10(rng, mean=5.00, std=2.50, size=n_train)
+    col4_train = sample_truncated_normal_1_to_10(rng, mean=5.00, std=2.50, size=n_train)
+    x_train = np.column_stack([col1_train, col2_train, col3_train, col4_train])
+
+    score_train = 0.75 * col1_train + 0.65 * col2_train - 7.2
+    y_train = (score_train > 0.0).astype(np.int32)
+
+    # Conjunto atual em operação (após data drift)
+    col1_prod = sample_truncated_normal_1_to_10(rng, mean=5.34, std=3.68, size=n_prod)
+    col2_prod = sample_truncated_normal_1_to_10(rng, mean=5.34, std=3.68, size=n_prod)
+    col3_prod = sample_truncated_normal_1_to_10(rng, mean=5.00, std=2.50, size=n_prod)
+    col4_prod = sample_truncated_normal_1_to_10(rng, mean=5.00, std=2.50, size=n_prod)
+    x_prod = np.column_stack([col1_prod, col2_prod, col3_prod, col4_prod])
+
+    # Regra original do modelo + mudança na distribuição dos dados de entrada
+    score_prod_true = 0.75 * col1_prod + 0.65 * col2_prod - 7.2
+    y_prod_true = (score_prod_true > 0.0).astype(np.int32)
+
+    return x_train, y_train, x_prod, y_prod_true
+
+
+def compute_psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
+    """Calcula o Population Stability Index (PSI) entre duas distribuições."""
+    quantiles = np.linspace(0.0, 1.0, bins + 1)
+    edges = np.quantile(expected, quantiles)
+    edges[0] = -np.inf
+    edges[-1] = np.inf
+
+    exp_counts, _ = np.histogram(expected, bins=edges)
+    act_counts, _ = np.histogram(actual, bins=edges)
+
+    eps = 1e-6
+    exp_pct = np.clip(exp_counts / max(len(expected), 1), eps, None)
+    act_pct = np.clip(act_counts / max(len(actual), 1), eps, None)
+
+    psi = np.sum((act_pct - exp_pct) * np.log(act_pct / exp_pct))
+    return float(psi)
+
+
+def summarize_column_drift(ref_col: np.ndarray, cur_col: np.ndarray) -> Dict[str, float]:
+    ks_stat, p_val = ks_2samp(ref_col, cur_col)
+    return {
+        "ref_mean": float(np.mean(ref_col)),
+        "ref_std": float(np.std(ref_col, ddof=1)),
+        "cur_mean": float(np.mean(cur_col)),
+        "cur_std": float(np.std(cur_col, ddof=1)),
+        "ks_stat": float(ks_stat),
+        "p_value": float(p_val),
+        "psi": compute_psi(ref_col, cur_col),
+    }
+
+
+def main() -> None:
+    x_train, y_train, x_prod, y_prod = generate_drift_sheets(
+        n_train=1000, n_prod=500, seed=42
+    )
+
+    # Divide o conjunto histórico em treino e teste (mesma distribuição de origem)
+    split = 750
+    x_tr, y_tr = x_train[:split], y_train[:split]
+    x_te, y_te = x_train[split:], y_train[split:]
+
+    model = RandomForestClassifier(n_estimators=150, max_depth=6, random_state=42)
+    model.fit(x_tr, y_tr)
+
+    pred_te = model.predict(x_te)
+    pred_prod = model.predict(x_prod)
+
+    prec_te = precision_score(y_te, pred_te, zero_division=0)
+    prec_prod = precision_score(y_prod, pred_prod, zero_division=0)
+
+    print("=== Desempenho do Modelo ===")
+    print(f"Precisão no conjunto de teste (histórico): {prec_te * 100:.2f}%")
+    print(f"Precisão na operação atual (planilhas novas): {prec_prod * 100:.2f}%\n")
+
+    print("=== Monitoramento de Data Drift nas Colunas Importantes ===")
+    for col_idx in (0, 1):
+        stats = summarize_column_drift(x_train[:, col_idx], x_prod[:, col_idx])
+        drift_flag = "DRIFT DETECTADO" if stats["p_value"] < 0.05 or stats["psi"] >= 0.2 else "ESTÁVEL"
+        print(
+            f"Coluna {col_idx + 1}: "
+            f"Treino(μ={stats['ref_mean']:.2f}, σ={stats['ref_std']:.2f}) -> "
+            f"Atual(μ={stats['cur_mean']:.2f}, σ={stats['cur_std']:.2f}) | "
+            f"KS={stats['ks_stat']:.3f} (p={stats['p_value']:.4f}) | "
+            f"PSI={stats['psi']:.3f} | {drift_flag}"
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: anonimizacao_dados.py
+================================================================================
+
+import csv
+from pathlib import Path
+from typing import Dict, List
+
+
+# 1. Encobrimento (generalização) no atributo Profissão:
+#    Agrupa profissões específicas em categorias mais amplas
+PROFISSAO_MAPPING: Dict[str, str] = {
+    "Agente Autonomo": "Agente",
+    "Agente Fiduciário": "Agente",
+    "Analista de Sistemas": "Profissional de TI",
+    "Engenheiro de Software": "Profissional de TI",
+}
+
+# Reagrupamento da Situação conforme o Conjunto de Dados B
+SITUACAO_MAPPING: Dict[str, str] = {
+    "Em Análise": "Sem acesso",
+    "Suspenso": "Sem acesso",
+    "Cancelado": "Sem acesso",
+    "Normal": "Com acesso",
+}
+
+# Mapeamento dos registros do Conjunto A para os identificadores/nomes do Conjunto B
+IDENTIDADE_B_MAPPING: Dict[int, Dict[str, object]] = {
+    10: {"ID": 2, "Nome": "Luis Alberto Souza"},
+    11: {"ID": 4, "Nome": "Juliana Lima Quinta"},
+    12: {"ID": 6, "Nome": "Dércio Rui Cunha"},
+    13: {"ID": 8, "Nome": "Edson Nilo da Silva"},
+}
+
+
+def truncar_cep(cep: str) -> str:
+    """Mantém apenas os 5 primeiros dígitos do CEP."""
+    digitos = "".join(ch for ch in cep if ch.isdigit())
+    return digitos[:5]
+
+
+def anonimizar_conjunto_a(registros_a: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Aplica encobrimento em Profissão e gera os registros no formato do Conjunto B."""
+    registros_b: List[Dict[str, object]] = []
+
+    for row in registros_a:
+        id_original = int(row["ID"])
+        profissao_original = str(row["Profissão"])
+        situacao_original = str(row["Situação"])
+        cep_original = str(row["CEP"])
+
+        # Encobrimento (generalização) da profissão; fallback genérico se não mapeada
+        profissao_anon = PROFISSAO_MAPPING.get(profissao_original, profissao_original)
+        situacao_anon = SITUACAO_MAPPING.get(situacao_original, situacao_original)
+        cep_anon = truncar_cep(cep_original)
+
+        identidade = IDENTIDADE_B_MAPPING.get(
+            id_original, {"ID": id_original, "Nome": row["Nome"]}
+        )
+
+        registros_b.append(
+            {
+                "ID": identidade["ID"],
+                "Nome": identidade["Nome"],
+                "Profissão": profissao_anon,
+                "CEP": cep_anon,
+                "Situação": situacao_anon,
+            }
+        )
+
+    return registros_b
+
+
+def salvar_csv(registros: List[Dict[str, object]], caminho: Path) -> None:
+    colunas = ["ID", "Nome", "Profissão", "CEP", "Situação"]
+    with caminho.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=colunas)
+        writer.writeheader()
+        writer.writerows(registros)
+
+
+def main() -> None:
+    conjunto_a: List[Dict[str, object]] = [
+        {
+            "ID": 10,
+            "Nome": "Luis Alberto Nascimento",
+            "Profissão": "Agente Autonomo",
+            "CEP": "20321-560",
+            "Situação": "Em Análise",
+        },
+        {
+            "ID": 11,
+            "Nome": "Juliana Lopes Quinta",
+            "Profissão": "Agente Fiduciário",
+            "CEP": "70125-120",
+            "Situação": "Suspenso",
+        },
+        {
+            "ID": 12,
+            "Nome": "Dércio Roberto Cunha",
+            "Profissão": "Analista de Sistemas",
+            "CEP": "15080-121",
+            "Situação": "Cancelado",
+        },
+        {
+            "ID": 13,
+            "Nome": "Edson Nilo do Nascimento",
+            "Profissão": "Engenheiro de Software",
+            "CEP": "32800-090",
+            "Situação": "Normal",
+        },
+    ]
+
+    conjunto_b = anonimizar_conjunto_a(conjunto_a)
+
+    print("Conjunto de Dados B gerado:\n")
+    for item in conjunto_b:
+        print(item)
+
+    saida_csv = Path("conjunto_dados_b.csv")
+    salvar_csv(conjunto_b, saida_csv)
+    print(f"\nArquivo salvo em: {saida_csv.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: selecao_bic_fraudes.py
+================================================================================
+
+from dataclasses import dataclass
+from typing import List, Tuple
+
+import numpy as np
+from xgboost import XGBClassifier
+
+
+@dataclass
+class CandidateFraudModel:
+    """Representa um modelo candidato avaliado pelo critério BIC."""
+
+    name: str
+    num_params: int          # k
+    max_likelihood: float    # L_hat
+    weight_scale: float      # intensidade de resposta mockada ao escore de fraude
+
+
+def generate_fraud_data(n_samples: int = 200, seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Gera base sintética de transações bancárias (n = 200):
+    colunas: [valor_normalizado, hora_atipica, frequencia_24h]
+    y: 1 = fraude, 0 = legítima
+    """
+    rng = np.random.default_rng(seed)
+    x = np.column_stack(
+        [
+            rng.normal(0.0, 1.0, size=n_samples),
+            rng.normal(0.0, 1.0, size=n_samples),
+            rng.normal(0.0, 1.0, size=n_samples),
+        ]
+    ).astype(np.float32)
+
+    logits = 1.2 * x[:, 0] + 0.9 * x[:, 1] + 0.7 * x[:, 2] - 1.1
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    y = (rng.random(n_samples) < probs).astype(np.int32)
+    return x, y
+
+
+def mock_predict_fraud_proba(model: CandidateFraudModel, x: np.ndarray) -> np.ndarray:
+    """Produz probabilidades mockadas de fraude usando apenas os `k` primeiros atributos."""
+    active_features = x[:, : model.num_params]
+    linear_score = active_features.sum(axis=1) * model.weight_scale - 0.5
+    return 1.0 / (1.0 + np.exp(-linear_score))
+
+
+def compute_bic(num_params: int, n_samples: int, max_likelihood: float) -> float:
+    """Calcula BIC = k * ln(n) - 2 * ln(L_hat)."""
+    if max_likelihood <= 0.0:
+        raise ValueError("max_likelihood deve ser maior que zero.")
+    return float(num_params * np.log(n_samples) - 2.0 * np.log(max_likelihood))
+
+
+def run_bic_selection(x_mock: np.ndarray, y_mock: np.ndarray) -> None:
+    n_samples = len(y_mock)
+
+    # M1: k=2, L=0.3 | M2: k=2, L=0.4 | M3: k=2, L=0.5 | M4: k=3, L=0.3 | M5: k=3, L=0.5
+    models: List[CandidateFraudModel] = [
+        CandidateFraudModel(name="M1", num_params=2, max_likelihood=0.3, weight_scale=0.6),
+        CandidateFraudModel(name="M2", num_params=2, max_likelihood=0.4, weight_scale=0.8),
+        CandidateFraudModel(name="M3", num_params=2, max_likelihood=0.5, weight_scale=1.0),
+        CandidateFraudModel(name="M4", num_params=3, max_likelihood=0.3, weight_scale=0.5),
+        CandidateFraudModel(name="M5", num_params=3, max_likelihood=0.5, weight_scale=0.9),
+    ]
+
+    print(f"=== Seleção via BIC | Amostra n = {n_samples} ===\n")
+    print(f"{'Modelo':<8} {'k':<4} {'L_hat':<8} {'k*ln(n)':<10} {'-2*ln(L)':<10} {'BIC':<10} {'Prob. Média Fraude'}")
+    print("-" * 74)
+
+    scored = []
+    for m in models:
+        probs = mock_predict_fraud_proba(m, x_mock)
+        bic = compute_bic(m.num_params, n_samples, m.max_likelihood)
+        penalty = m.num_params * np.log(n_samples)
+        lik_term = -2.0 * np.log(m.max_likelihood)
+        scored.append((bic, m, float(probs.mean())))
+        print(
+            f"{m.name:<8} {m.num_params:<4} {m.max_likelihood:<8.2f} "
+            f"{penalty:<10.4f} {lik_term:<10.4f} {bic:<10.4f} {probs.mean():.4f}"
+        )
+
+    best_bic, best_model, _ = min(scored, key=lambda item: item[0])
+    print(f"\nModelo selecionado (menor BIC): {best_model.name} (BIC = {best_bic:.4f})\n")
+
+
+def run_xgboost_baseline(x_train: np.ndarray, y_train: np.ndarray) -> None:
+    xgb_model = XGBClassifier(
+        n_estimators=50,
+        max_depth=3,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="logloss",
+        random_state=42,
+    )
+    xgb_model.fit(x_train, y_train)
+    fraud_probs = xgb_model.predict_proba(x_train)[:, 1]
+
+    print("=== Baseline com XGBoost ===")
+    print(f"Instância treinada: {type(xgb_model).__name__}")
+    print(f"Amostras avaliadas: {len(y_train)}")
+    print(f"Probabilidade média de fraude prevista: {fraud_probs.mean():.4f}")
+
+
+def main() -> None:
+    x_data, y_data = generate_fraud_data(n_samples=200, seed=42)
+    run_bic_selection(x_data.astype(np.float64), y_data)
+    run_xgboost_baseline(x_data, y_data)
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: analise_variabilidade_risco_resgate.py
+================================================================================
+
+import math
+from typing import Dict
+
+import numpy as np
+from scipy.stats import norm
+
+
+def calcular_metricas_vetor(v: np.ndarray) -> Dict[str, float]:
+    mediana = float(np.median(v))
+    media = float(np.mean(v))
+    l1 = float(np.sum(np.abs(v)))
+    l2 = float(np.linalg.norm(v, ord=2))
+    desvio_mediana_l1 = float(np.sum(np.abs(v - mediana)))
+    raiz_sq_media = float(np.sqrt(np.sum((v - media) ** 2)))
+    return {
+        "norma_l1": l1,
+        "norma_l2": l2,
+        "soma_abs_desvio_mediana": desvio_mediana_l1,
+        "raiz_soma_sq_desvio_media": raiz_sq_media,
+    }
+
+
+def bayes_inadimplencia_normal(mu: float = 6.0, sigma: float = 2.0) -> float:
+    p_lt_4 = float(norm.cdf((4.0 - mu) / sigma))
+    p_4_7 = float(norm.cdf((7.0 - mu) / sigma) - norm.cdf((4.0 - mu) / sigma))
+    p_gt_7 = float(1.0 - norm.cdf((7.0 - mu) / sigma))
+
+    num = 0.4 * p_4_7
+    den = 0.2 * p_lt_4 + 0.4 * p_4_7 + 0.6 * p_gt_7
+    return num / den
+
+
+def esperado_aprovados_binomial(
+    n_candidatos: int = 2048,
+    n_questoes: int = 6,
+    p_acerto: float = 0.25,
+    min_acertos: int = 4,
+) -> float:
+    prob_aprovacao = sum(
+        math.comb(n_questoes, k) * (p_acerto**k) * ((1.0 - p_acerto) ** (n_questoes - k))
+        for k in range(min_acertos, n_questoes + 1)
+    )
+    return n_candidatos * prob_aprovacao
+
+
+def mediana_exponencial(taxa_lambda: float = 0.05) -> float:
+    return math.log(2.0) / taxa_lambda
+
+
+def main() -> None:
+    v = np.array([2.0, -1.0, 4.0, -2.0])
+    metricas = calcular_metricas_vetor(v)
+    print("=== 1. Métricas de Variabilidade do Vetor ===")
+    for k, val in metricas.items():
+        print(f"  {k}: {val:.4f}")
+
+    prob_cond = bayes_inadimplencia_normal()
+    print("\n=== 2. Inadimplência Condicional (Normal) ===")
+    print(f"  P(4 <= X <= 7 | Inadimplente) ≈ {prob_cond:.4f} (106/215 ≈ {106/215:.4f})")
+
+    esp_aprov = esperado_aprovados_binomial()
+    print("\n=== 3. Concurso (Binomial) ===")
+    print(f"  Valor esperado de aprovados (>=4 acertos): {esp_aprov:.2f}")
+
+    t_mediana = mediana_exponencial()
+    print("\n=== 4. Tempo até 50% de Resgates (Exponencial) ===")
+    print(f"  Período mediano: {t_mediana:.2f} meses (~{round(t_mediana)} meses)")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: econometria_series_cvm.py
+================================================================================
+
+import numpy as np
+from scipy.stats import t
+
+
+def q57_ic_regressao(
+    beta1: float = 0.627, ep_beta1: float = 0.300, n: int = 20, alpha: float = 0.05
+) -> tuple[float, float, bool]:
+    df = n - 2
+    t_crit = float(t.ppf(1.0 - alpha / 2.0, df=df))
+    li = beta1 - t_crit * ep_beta1
+    ls = beta1 + t_crit * ep_beta1
+    significante = not (li <= 0.0 <= ls)
+    return li, ls, significante
+
+
+def q58_cov_estimadores_mqo(x: np.ndarray, residuos: np.ndarray) -> float:
+    n = len(x)
+    x_bar = float(np.mean(x))
+    sxx = float(np.sum((x - x_bar) ** 2))
+    sigma2_hat = float(np.sum(residuos**2) / (n - 2))
+    return -(x_bar * sigma2_hat) / sxx
+
+
+def q59_ar1_intercepto(media_longo_prazo: float = 4.0, phi1: float = 0.8) -> float:
+    # mu = phi0 / (1 - phi1) => phi0 = mu * (1 - phi1)
+    return media_longo_prazo * (1.0 - phi1)
+
+
+def main() -> None:
+    li, ls, sig = q57_ic_regressao()
+    print(f"Q57 | IC 95% beta1: [{li:.3f}; {ls:.3f}] | Significante (5%)? {sig}")
+
+    cov_b0_b1 = q58_cov_estimadores_mqo(
+        x=np.array([1.0, 2.0, 2.0]),
+        residuos=np.array([2.0, 1.0, 1.0]),
+    )
+    print(f"Q58 | Cov(beta0_hat, beta1_hat) = {cov_b0_b1:.2f}")
+
+    phi0 = q59_ar1_intercepto(media_longo_prazo=4.0, phi1=0.8)
+    print(f"Q59 | phi0 do AR(1) = {phi0:.2f}")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: pipeline_completo_regressao_auditoria.py
+================================================================================
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer
+from sklearn.metrics import (
+    confusion_matrix,
+    mean_squared_error,
+    precision_score,
+    r2_score,
+    recall_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPRegressor
+
+
+UFS_BRASIL: List[str] = [
+    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO",
+    "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI",
+    "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO",
+]
+
+ESCOLARIDADE_ORDEM: Dict[str, int] = {
+    "fundamental": 0,
+    "médio": 1,
+    "superior": 2,
+    "pós-graduação": 3,
+}
+
+LOCAIS_TRABALHO: List[str] = ["empresa", "home office", "misto"]
+
+
+@dataclass
+class PipelineConfig:
+    idade_min: float = 18.0
+    idade_max: float = 90.0
+    target_recall: float = 0.90
+    cost_false_negative: float = 50.0
+    cost_false_positive: float = 5.0
+
+
+def encode_observation_32d(
+    obs: Dict[str, object],
+    cfg: PipelineConfig,
+) -> np.ndarray:
+    """
+    Converte uma observação em exatamente 32 valores numéricos em [0, 1]:
+      - 1 valor: idade normalizada
+      - 1 valor: escolaridade ordinal normalizada em [0, 1]
+      - 27 valores: one-hot para 26 estados + DF
+      - 3 valores: one-hot para local de trabalho
+    Total: 1 + 1 + 27 + 3 = 32
+    """
+    idade = float(obs["idade"])  # idade >= 18
+    idade_norm = np.clip(
+        (idade - cfg.idade_min) / max(cfg.idade_max - cfg.idade_min, 1e-6),
+        0.0,
+        1.0,
+    )
+
+    escol_key = str(obs["escolaridade"]).strip().lower()
+    escol_rank = ESCOLARIDADE_ORDEM[escol_key]
+    escol_norm = escol_rank / float(len(ESCOLARIDADE_ORDEM) - 1)  # 0.0, 1/3, 2/3, 1.0
+
+    uf_val = str(obs["uf"]).strip().upper()
+    uf_one_hot = [1.0 if uf == uf_val else 0.0 for uf in UFS_BRASIL]
+
+    local_val = str(obs["local_trabalho"]).strip().lower()
+    local_one_hot = [1.0 if loc == local_val else 0.0 for loc in LOCAIS_TRABALHO]
+
+    vec = np.array(
+        [idade_norm, escol_norm, *uf_one_hot, *local_one_hot],
+        dtype=np.float32,
+    )
+    assert vec.shape == (32,), f"Esperado vetor de 32 dimensões, obtido {vec.shape}"
+    return vec
+
+
+def generate_synthetic_records(
+    n_samples: int = 600,
+    missing_rate: float = 0.15,
+    cfg: PipelineConfig = PipelineConfig(),
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Gera matriz 32D em [0, 1], alvo contínuo de regressão em [0, 1] e rótulo binário
+    de auditoria detalhada (1 = exige exame detalhado, 0 = não exige).
+    """
+    rng = np.random.default_rng(seed)
+    x_matrix = np.zeros((n_samples, 32), dtype=np.float32)
+
+    for i in range(n_samples):
+        obs = {
+            "idade": int(rng.integers(18, 86)),
+            "escolaridade": str(rng.choice(list(ESCOLARIDADE_ORDEM.keys()))),
+            "uf": str(rng.choice(UFS_BRASIL)),
+            "local_trabalho": str(rng.choice(LOCAIS_TRABALHO)),
+        }
+        x_matrix[i] = encode_observation_32d(obs, cfg)
+
+    # Alvo contínuo de regressão em [0, 1] (ex.: índice de complexidade/risco)
+    raw_score = (
+        0.35 * x_matrix[:, 0]      # idade normalizada
+        + 0.45 * x_matrix[:, 1]    # escolaridade ordinal normalizada
+        + 0.25 * x_matrix[:, 24]   # UF 'SP' como exemplo de peso regional
+        + 0.20 * x_matrix[:, 30]   # 'misto'
+        + rng.normal(0.0, 0.08, size=n_samples)
+    )
+    y_reg = np.clip(
+        (raw_score - raw_score.min()) / max(raw_score.max() - raw_score.min(), 1e-6),
+        0.0,
+        1.0,
+    ).astype(np.float32)
+
+    # Rótulo binário de auditoria: 1 se exige exame detalhado, 0 caso contrário
+    y_audit = (y_reg >= 0.55).astype(np.int32)
+
+    # Insere valores ausentes (NaN) na coluna de idade (índice 0) e escolaridade (índice 1)
+    x_with_nan = x_matrix.copy()
+    mask_age = rng.random(n_samples) < missing_rate
+    mask_edu = rng.random(n_samples) < (missing_rate * 0.7)
+    x_with_nan[mask_age, 0] = np.nan
+    x_with_nan[mask_edu, 1] = np.nan
+
+    return x_with_nan, y_reg, y_audit
+
+
+def choose_missing_data_strategy(x_nan: np.ndarray) -> str:
+    """
+    Avalia número de observações restantes após remoção e correlação absoluta média
+    entre atributos contínuos/ordinais para decidir entre remoção ou imputação multivariável.
+    """
+    n_total = len(x_nan)
+    complete_mask = ~np.isnan(x_nan).any(axis=1)
+    n_complete = int(complete_mask.sum())
+    frac_complete = n_complete / max(n_total, 1)
+
+    valid_rows = x_nan[complete_mask]
+    if len(valid_rows) > 2:
+        corr = np.corrcoef(valid_rows[:, :2], rowvar=False)
+        mean_abs_corr = float(np.abs(corr[0, 1]))
+    else:
+        mean_abs_corr = 0.0
+
+    print(
+        f"Diagnóstico de faltantes -> Linhas completas: {n_complete}/{n_total} "
+        f"({frac_complete * 100:.1f}%) | |corr(idade, escolaridade)|: {mean_abs_corr:.3f}"
+    )
+
+    if frac_complete >= 0.90 and mean_abs_corr < 0.15:
+        return "remocao"
+    return "imputacao_multivariavel"
+
+
+def find_threshold_for_recall(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    min_recall: float,
+) -> float:
+    """Seleciona o maior limiar que mantém a revocação >= min_recall."""
+    thresholds = np.linspace(0.05, 0.95, 181)
+    valid = [
+        float(th)
+        for th in thresholds
+        if recall_score(y_true, (y_proba >= th).astype(np.int32), zero_division=0) >= min_recall
+    ]
+    if valid:
+        return max(valid)
+    return float(
+        max(
+            thresholds,
+            key=lambda th: recall_score(
+                y_true, (y_proba >= th).astype(np.int32), zero_division=0
+            ),
+        )
+    )
+
+
+def main() -> None:
+    cfg = PipelineConfig()
+    x_nan, y_reg, y_audit = generate_synthetic_records(
+        n_samples=600, missing_rate=0.15, cfg=cfg, seed=42
+    )
+
+    # 1. Escolha entre remoção de observações e imputação multivariável
+    strategy = choose_missing_data_strategy(x_nan)
+    print(f"Estratégia escolhida: {strategy}\n")
+
+    if strategy == "remocao":
+        keep = ~np.isnan(x_nan).any(axis=1)
+        x_clean = x_nan[keep]
+        y_reg_clean = y_reg[keep]
+        y_audit_clean = y_audit[keep]
+    else:
+        imputer = IterativeImputer(max_iter=15, random_state=42)
+        x_clean = np.clip(imputer.fit_transform(x_nan), 0.0, 1.0).astype(np.float32)
+        y_reg_clean = y_reg
+        y_audit_clean = y_audit
+
+    x_train, x_temp, y_reg_tr, y_reg_tmp, y_aud_tr, y_aud_tmp = train_test_split(
+        x_clean, y_reg_clean, y_audit_clean, test_size=0.30, stratify=y_audit_clean, random_state=42
+    )
+    x_val, x_test, y_reg_val, y_reg_te, y_aud_val, y_aud_te = train_test_split(
+        x_temp, y_reg_tmp, y_aud_tmp, test_size=0.50, stratify=y_aud_tmp, random_state=42
+    )
+
+    # 2. Rede neural de regressão (entrada 32D em [0, 1] -> saída contínua em [0, 1])
+    reg_model = MLPRegressor(
+        hidden_layer_sizes=(64, 32),
+        activation="relu",
+        max_iter=300,
+        random_state=42,
+    )
+    reg_model.fit(x_train, y_reg_tr)
+    y_reg_pred = np.clip(reg_model.predict(x_test), 0.0, 1.0)
+    mse = mean_squared_error(y_reg_te, y_reg_pred)
+    r2 = r2_score(y_reg_te, y_reg_pred)
+
+    print("=== 1. Rede Neural de Regressão (32 features em [0, 1]) ===")
+    print(f"Dimensão da entrada: {x_train.shape[1]} | MSE: {mse:.4f} | R²: {r2:.4f}\n")
+
+    # 3. Classificador de triagem de auditoria focado em revocação (recall)
+    clf_model = HistGradientBoostingClassifier(
+        max_iter=120, learning_rate=0.05, max_depth=4, random_state=42
+    )
+    clf_model.fit(x_train, y_aud_tr)
+
+    val_proba = clf_model.predict_proba(x_val)[:, 1]
+    best_th = find_threshold_for_recall(y_aud_val, val_proba, cfg.target_recall)
+
+    test_proba = clf_model.predict_proba(x_test)[:, 1]
+    test_pred = (test_proba >= best_th).astype(np.int32)
+
+    tn, fp, fn, tp = confusion_matrix(y_aud_te, test_pred).ravel()
+    rec = recall_score(y_aud_te, test_pred, zero_division=0)
+    prec = precision_score(y_aud_te, test_pred, zero_division=0)
+    custo = fn * cfg.cost_false_negative + fp * cfg.cost_false_positive
+
+    print(f"=== 2. Classificação de Auditoria (threshold={best_th:.2f}) ===")
+    print(f"Revocação (Recall): {rec:.4f} | Precisão: {prec:.4f}")
+    print(f"Matriz (VP={tp}, VN={tn}, FP={fp}, FN={fn}) | Custo estimado: R$ {custo:,.2f}")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: datamart_cvm_etl_analise.py
+================================================================================
+
+import sqlite3
+from typing import Dict, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.stats import chi2, norm, t
+
+
+def demonstrar_reshape_12() -> np.ndarray:
+    """Reproduz arr.reshape(2, 3, 2) sobre os inteiros de 1 a 12."""
+    arr = np.arange(1, 13, dtype=np.int32)
+    return arr.reshape(2, 3, 2)
+
+
+def executar_etl_datamart_cvm(
+    taxa_usd_brl: float = 5.40,
+) -> Tuple[sqlite3.Connection, pd.DataFrame, pd.DataFrame]:
+    """
+    Simula extração de transações CVM em R$ (BRL) e US$ (USD), limpa linhas
+    com dados ausentes usando dropna e carrega Dimensão Moeda + Tabela Fato.
+    """
+    raw_df = pd.DataFrame(
+        [
+            {"id_transacao": 101, "ativo": "PETR4", "moeda": "BRL", "valor_transacao": 150000.0},
+            {"id_transacao": 102, "ativo": "AAPL", "moeda": "USD", "valor_transacao": 25000.0},
+            {"id_transacao": 103, "ativo": "VALE3", "moeda": "BRL", "valor_transacao": np.nan},
+            {"id_transacao": 104, "ativo": "MSFT", "moeda": "USD", "valor_transacao": 40000.0},
+            {"id_transacao": 105, "ativo": "ITUB4", "moeda": "BRL", "valor_transacao": 90000.0},
+        ]
+    )
+
+    # Limpeza: remove linhas com células vazias/nulas
+    df_limpo = raw_df.dropna().copy()
+
+    # Regra de negócio de conversão para moeda base de análise (BRL)
+    fato_df = pd.DataFrame(
+        {
+            "id_transacao": df_limpo["id_transacao"].astype(int),
+            "ativo": df_limpo["ativo"].astype(str),
+            "moeda_transacao": df_limpo["moeda"].astype(str),
+            "valor_moeda_transacao": df_limpo["valor_transacao"].astype(float),
+            "taxa_cambio_brl": np.where(
+                df_limpo["moeda"] == "USD", taxa_usd_brl, 1.0
+            ),
+        }
+    )
+    fato_df["valor_convertido_brl"] = (
+        fato_df["valor_moeda_transacao"] * fato_df["taxa_cambio_brl"]
+    )
+
+    dim_moeda = pd.DataFrame(
+        [
+            {"codigo_moeda": "BRL", "nome_moeda": "Real", "mercado": "Nacional"},
+            {"codigo_moeda": "USD", "nome_moeda": "Dólar Americano", "mercado": "Internacional"},
+        ]
+    )
+
+    conn = sqlite3.connect(":memory:")
+    dim_moeda.to_sql("DIM_MOEDA", conn, index=False, if_exists="replace")
+    fato_df.to_sql("FATO_TRANSACAO_CVM", conn, index=False, if_exists="replace")
+
+    return conn, raw_df, fato_df
+
+
+def resumo_estatistico_amostra(valores: np.ndarray, mu_0: float = 0.0) -> Dict[str, float]:
+    """Calcula média, desvio amostral, estatística Z e quantis de referência (t e chi2)."""
+    n = len(valores)
+    media = float(np.mean(valores))
+    dp = float(np.std(valores, ddof=1))
+    erro_padrao = dp / np.sqrt(n)
+    z_stat = (media - mu_0) / max(erro_padrao, 1e-9)
+    p_bicaudal = float(2.0 * (1.0 - norm.cdf(abs(z_stat))))
+
+    return {
+        "n": float(n),
+        "media": media,
+        "desvio_padrao": dp,
+        "z_stat": float(z_stat),
+        "p_valor_z_bicaudal": p_bicaudal,
+        "t_crit_df15_bicaudal_5pct": float(t.ppf(0.975, df=15)),
+        "chi2_crit_df8_sup_5pct": float(chi2.ppf(0.95, df=8)),
+    }
+
+
+def main() -> None:
+    # 1. NumPy reshape(2, 3, 2)
+    reshaped = demonstrar_reshape_12()
+    print("=== 1. Array NumPy reshape(2, 3, 2) ===")
+    print(reshaped)
+    print(f"Shape: {reshaped.shape}\n")
+
+    # 2. ETL + Data Mart Financeiro CVM
+    conn, raw_df, fato_df = executar_etl_datamart_cvm(taxa_usd_brl=5.40)
+    print("=== 2. Limpeza Pandas (dropna) e Fato Consolidada ===")
+    print(f"Linhas antes do dropna: {len(raw_df)} | Linhas após dropna: {len(fato_df)}")
+    print(fato_df.to_string(index=False))
+
+    consulta_dm = conn.execute(
+        """
+        SELECT
+            m.mercado,
+            f.moeda_transacao,
+            COUNT(*) AS qtd_operacoes,
+            ROUND(SUM(f.valor_convertido_brl), 2) AS total_brl
+        FROM FATO_TRANSACAO_CVM f
+        INNER JOIN DIM_MOEDA m ON f.moeda_transacao = m.codigo_moeda
+        GROUP BY m.mercado, f.moeda_transacao
+        ORDER BY f.moeda_transacao;
+        """
+    ).fetchall()
+
+    print("\nAgregação no Data Mart (SQLite):")
+    for mercado, moeda, qtd, total_brl in consulta_dm:
+        print(f"  {mercado} ({moeda}): {qtd} operações | Total convertido = R$ {total_brl:,.2f}")
+
+    # 3. Apoio estatístico sobre valores convertidos (normalizados)
+    stats = resumo_estatistico_amostra(fato_df["valor_convertido_brl"].to_numpy(), mu_0=150000.0)
+    print("\n=== 3. Resumo Estatístico ===")
+    for chave, valor in stats.items():
+        print(f"  {chave}: {valor:.4f}")
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: pipeline_mer_keras_sklearn.py
+================================================================================
+
+import sqlite3
+from typing import Tuple
+
+import numpy as np
+from sklearn.linear_model import Ridge
+
+
+def linear_dense_layer(x: np.ndarray, weights: np.ndarray, bias: np.ndarray) -> np.ndarray:
+    """
+    Simula uma camada densa com ativação linear por omissão (f(z) = z),
+    equivalente a tf.keras.layers.Dense(units, activation=None).
+    """
+    return x @ weights + bias
+
+
+def init_mer_sqlite() -> sqlite3.Connection:
+    """
+    Cria em memória uma representação relacional simplificada do MER:
+      - A, B, C, E: entidades principais
+      - G: entidade fraca associada a C via relacionamento F
+      - I, J: subtipos/especializações de E (herdam ligação a E e ao contexto de B)
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE A (
+            id_a INTEGER PRIMARY KEY,
+            nome TEXT NOT NULL,
+            id_a_auto INTEGER REFERENCES A(id_a)
+        );
+
+        CREATE TABLE C (
+            id_c INTEGER PRIMARY KEY,
+            descricao TEXT NOT NULL
+        );
+
+        CREATE TABLE B (
+            id_b INTEGER PRIMARY KEY,
+            id_a INTEGER NOT NULL REFERENCES A(id_a),
+            id_c INTEGER NOT NULL REFERENCES C(id_c),
+            rotulo TEXT NOT NULL
+        );
+
+        CREATE TABLE G (
+            id_c INTEGER NOT NULL REFERENCES C(id_c),
+            seq_g INTEGER NOT NULL,
+            detalhe_fraco TEXT NOT NULL,
+            PRIMARY KEY (id_c, seq_g)
+        );
+
+        CREATE TABLE E (
+            id_e INTEGER PRIMARY KEY,
+            id_b INTEGER REFERENCES B(id_b),
+            tipo_base TEXT NOT NULL
+        );
+
+        CREATE TABLE I (
+            id_e INTEGER PRIMARY KEY REFERENCES E(id_e),
+            atributo_i TEXT NOT NULL
+        );
+
+        CREATE TABLE J (
+            id_e INTEGER PRIMARY KEY REFERENCES E(id_e),
+            atributo_j TEXT NOT NULL
+        );
+
+        INSERT INTO A (id_a, nome, id_a_auto) VALUES
+            (1, 'Entidade_A1', NULL),
+            (2, 'Entidade_A2', 1);
+
+        INSERT INTO C (id_c, descricao) VALUES
+            (10, 'Contexto_C1'),
+            (20, 'Contexto_C2');
+
+        INSERT INTO B (id_b, id_a, id_c, rotulo) VALUES
+            (100, 1, 10, 'Relacao_B1'),
+            (101, 2, 20, 'Relacao_B2');
+
+        INSERT INTO G (id_c, seq_g, detalhe_fraco) VALUES
+            (10, 1, 'Detalhe_G_via_F_10'),
+            (20, 1, 'Detalhe_G_via_F_20');
+
+        INSERT INTO E (id_e, id_b, tipo_base) VALUES
+            (1, 100, 'Subtipo_I'),
+            (2, 101, 'Subtipo_J');
+
+        INSERT INTO I (id_e, atributo_i) VALUES (1, 'Valor_I_1');
+        INSERT INTO J (id_e, atributo_j) VALUES (2, 'Valor_J_2');
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def fetch_subtypes_and_features(conn: sqlite3.Connection) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Consulta subtipos I e J (derivados de E e associados a B) e constrói
+    matriz numérica de features X e alvo contínuo y.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            E.id_e,
+            E.id_b,
+            CASE WHEN I.id_e IS NOT NULL THEN 1.0 ELSE 0.0 END AS eh_i,
+            CASE WHEN J.id_e IS NOT NULL THEN 1.0 ELSE 0.0 END AS eh_j,
+            LENGTH(COALESCE(I.atributo_i, J.atributo_j, '')) AS tam_attr
+        FROM E
+        LEFT JOIN I ON I.id_e = E.id_e
+        LEFT JOIN J ON J.id_e = E.id_e
+        ORDER BY E.id_e;
+        """
+    ).fetchall()
+
+    x = np.array(
+        [[float(r[1]), float(r[2]), float(r[3]), float(r[4])] for r in rows],
+        dtype=np.float64,
+    )
+    y = np.array([float(r[0]) * 10.0 + float(r[4]) for r in rows], dtype=np.float64)
+    return x, y
+
+
+def main() -> None:
+    conn = init_mer_sqlite()
+
+    # Verifica que subtipos I e J podem associar-se a B através de E
+    ligacoes_b = conn.execute(
+        """
+        SELECT
+            B.rotulo,
+            E.id_e,
+            CASE
+                WHEN I.id_e IS NOT NULL THEN 'I'
+                WHEN J.id_e IS NOT NULL THEN 'J'
+                ELSE 'E'
+            END AS subtipo
+        FROM B
+        INNER JOIN E ON E.id_b = B.id_b
+        LEFT JOIN I ON I.id_e = E.id_e
+        LEFT JOIN J ON J.id_e = E.id_e
+        ORDER BY B.id_b;
+        """
+    ).fetchall()
+
+    print("=== 1. Ligação dos subtipos I e J a B (via E) no SQLite ===")
+    for rotulo, id_e, subtipo in ligacoes_b:
+        print(f"  Relação={rotulo} | E.id_e={id_e} | Subtipo={subtipo}")
+
+    # Conjunto de treino (X1, y) e conjunto novo (X2)
+    x_all, y_all = fetch_subtypes_and_features(conn)
+    x1, y1 = x_all, y_all
+    rng = np.random.default_rng(42)
+    x2 = np.column_stack(
+        [
+            rng.choice([100.0, 101.0], size=4),
+            rng.choice([0.0, 1.0], size=4),
+            rng.choice([0.0, 1.0], size=4),
+            rng.integers(5, 15, size=4).astype(np.float64),
+        ]
+    )
+
+    # Estimador scikit-learn: fit(X1, y) e predict(X2)
+    clf = Ridge(alpha=1.0)
+    clf.fit(x1, y1)
+    pred_sklearn = clf.predict(x2)
+
+    # Camada densa com ativação linear (identidade) aplicada sobre as previsões
+    w_dense = np.array([[1.0]], dtype=np.float64)
+    b_dense = np.array([0.0], dtype=np.float64)
+    out_dense_linear = linear_dense_layer(pred_sklearn.reshape(-1, 1), w_dense, b_dense).ravel()
+
+    print("\n=== 2. Estimador scikit-learn (fit / predict) + Camada Linear ===")
+    for idx, (val_sk, val_lin) in enumerate(zip(pred_sklearn, out_dense_linear), start=1):
+        print(f"  Amostra X2[{idx}] -> predict(X2)={val_sk:.4f} | Dense(linear)={val_lin:.4f}")
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: modelo_auditoria.py
+================================================================================
+
+import json
+import re
+import sqlite3
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import FeatureUnion
+from sklearn.preprocessing import FunctionTransformer
+
+
+@dataclass
+class AuditConfig:
+    cost_false_negative: float = 50.0
+    cost_false_positive: float = 5.0
+    target_recall: float = 0.90
+
+
+PT_STOPWORDS = {
+    "a", "ao", "aos", "aquela", "aquelas", "aquele", "aqueles", "as", "até",
+    "com", "como", "da", "das", "de", "dela", "delas", "dele", "deles",
+    "depois", "do", "dos", "e", "ela", "elas", "ele", "eles", "em", "entre",
+    "era", "eram", "essa", "essas", "esse", "esses", "esta", "estas", "este",
+    "estes", "eu", "foi", "foram", "há", "isso", "isto", "já", "lhe", "lhes",
+    "mais", "mas", "me", "mesmo", "meu", "meus", "minha", "minhas", "muito",
+    "na", "não", "nas", "nem", "no", "nos", "nós", "num", "numa", "o", "os",
+    "ou", "para", "pela", "pelas", "pelo", "pelos", "por", "qual", "quando",
+    "que", "quem", "são", "se", "sem", "ser", "seu", "seus", "só", "somos",
+    "sou", "sua", "suas", "também", "te", "tem", "têm", "ter", "teu", "teus",
+    "toda", "todas", "todo", "todos", "tu", "tua", "tuas", "um", "uma", "umas",
+    "uns", "você", "vocês", "vos",
+}
+
+
+def nltk_like_tokenize(text: str) -> List[str]:
+    """Tokeniza palavras e pontuações de forma semelhante ao word_tokenize."""
+    return re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)
+
+
+def filter_stopwords_exact(tokens: List[str], stopwords: set[str] = PT_STOPWORDS) -> List[str]:
+    """Replica o comportamento literal: w not in stop_words (sensível a maiúsculas/pontuação)."""
+    return [w for w in tokens if w not in stopwords]
+
+
+def analyze_syntax_sample(tokens: List[str]) -> List[Tuple[str, str, str]]:
+    """Anotação morfossintática/sintática simplificada para inspeção textual."""
+    verbs = {"roeu", "apresentou", "omitiu", "declarou", "divergiu", "auditou", "registrou"}
+    annotated: List[Tuple[str, str, str]] = []
+    for idx, tok in enumerate(tokens):
+        if re.fullmatch(r"[^\w\s]", tok):
+            pos, dep = "PUNCT", "punct"
+        elif tok.lower() in verbs:
+            pos = "VERB"
+            dep = "ROOT" if idx > 0 else "root"
+        elif tok[0:1].isupper() and idx > 0:
+            pos, dep = "PROPN", "nmod"
+        else:
+            pos, dep = "NOUN", "obj"
+        annotated.append((tok, pos, dep))
+    return annotated
+
+
+SQL_SCHEMA_SEED = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE AUDITOR (
+    ID_A INT NOT NULL,
+    Nome VARCHAR(20),
+    PRIMARY KEY (ID_A)
+);
+
+CREATE TABLE AUDITADO (
+    ID_O INT NOT NULL,
+    Nome VARCHAR(20),
+    ID_A INT,
+    PRIMARY KEY (ID_O),
+    FOREIGN KEY (ID_A) REFERENCES AUDITOR(ID_A)
+);
+
+CREATE TABLE TRIAGEM_AUDITORIA (
+    ID_TRIAGEM INTEGER PRIMARY KEY AUTOINCREMENT,
+    ID_O INT NOT NULL,
+    EXAME_DETALHADO INT NOT NULL,
+    PROB_RISCO REAL NOT NULL,
+    FOREIGN KEY (ID_O) REFERENCES AUDITADO(ID_O)
+);
+
+CREATE TABLE RELATOS_AUDITORIA (
+    ID_RELATO INTEGER PRIMARY KEY AUTOINCREMENT,
+    ID_O INT NOT NULL,
+    PAYLOAD_JSON TEXT NOT NULL,
+    TEXTO_RELATO TEXT NOT NULL,
+    ROTULO_EXAME INT NOT NULL,
+    FOREIGN KEY (ID_O) REFERENCES AUDITADO(ID_O)
+);
+
+INSERT INTO AUDITOR (ID_A, Nome) VALUES (1, 'Maite');
+INSERT INTO AUDITOR (ID_A, Nome) VALUES (2, 'Lucca');
+INSERT INTO AUDITOR (ID_A, Nome) VALUES (3, 'Maria Clara');
+
+INSERT INTO AUDITADO (ID_O, Nome, ID_A) VALUES (1, 'Felipe', 1);
+INSERT INTO AUDITADO (ID_O, Nome, ID_A) VALUES (2, 'Stella', 2);
+INSERT INTO AUDITADO (ID_O, Nome, ID_A) VALUES (3, 'Patricia', NULL);
+"""
+
+
+def build_nlp_audit_dataset(seed: int = 42) -> Tuple[List[Dict[str, object]], List[str], np.ndarray]:
+    """Cria textos e metadados JSON para treino e avaliação do classificador NLP."""
+    rng = np.random.default_rng(seed)
+
+    casos_complexos = [
+        "Divergência relevante na declaração de receitas e transferência atípica no exterior sem comprovante.",
+        "Omissão de passivo contingente e inconsistência entre notas fiscais emitidas e escrituração contábil.",
+        "Movimentação fracionada suspeita com indícios de fraude e divergência patrimonial significativa.",
+        "Lançamento contábil sem lastro documental e inconsistência fiscal em operação de alto valor.",
+    ]
+    casos_simples = [
+        "Documentação regular conferida sem divergências relevantes no período fiscalizado.",
+        "Operação rotineira com comprovantes válidos e conciliação bancária sem inconsistências.",
+        "Declaração dentro dos parâmetros esperados sem pendências ou divergências cadastrais.",
+        "Registro simples revisado e validado sem indícios de irregularidade na documentação.",
+    ]
+
+    texts: List[str] = []
+    labels: List[int] = []
+    records: List[Dict[str, object]] = []
+
+    n_per_class = 180
+    for _ in range(n_per_class):
+        t_pos = str(rng.choice(casos_complexos))
+        texts.append(t_pos)
+        labels.append(1)
+        records.append(
+            {
+                "id_o": int(rng.choice([1, 2, 3])),
+                "payload": json.dumps(
+                    {
+                        "responsaveis": ["Joca", "Ana", "Pedro"],
+                        "valor_mil": int(rng.integers(150, 900)),
+                        "alerta": True,
+                    },
+                    ensure_ascii=False,
+                ),
+                "texto": t_pos,
+                "rotulo": 1,
+            }
+        )
+
+        t_neg = str(rng.choice(casos_simples))
+        texts.append(t_neg)
+        labels.append(0)
+        records.append(
+            {
+                "id_o": int(rng.choice([1, 2, 3])),
+                "payload": json.dumps(
+                    {
+                        "responsaveis": ["Joca", "Ana", "Pedro"],
+                        "valor_mil": int(rng.integers(10, 120)),
+                        "alerta": False,
+                    },
+                    ensure_ascii=False,
+                ),
+                "texto": t_neg,
+                "rotulo": 0,
+            }
+        )
+
+    perm = rng.permutation(len(texts))
+    texts_shuf = [texts[i] for i in perm]
+    labels_shuf = np.array([labels[i] for i in perm], dtype=np.int32)
+    records_shuf = [records[i] for i in perm]
+    return records_shuf, texts_shuf, labels_shuf
+
+
+def lexical_stats_features(texts: List[str]) -> np.ndarray:
+    """Extrai estatísticas lexicais simples (tamanho em tokens e presença de termos de risco)."""
+    risk_terms = {"divergência", "omissão", "fraude", "inconsistência", "atípica", "exterior", "sem"}
+    feats: List[List[float]] = []
+    for txt in texts:
+        tokens = filter_stopwords_exact(nltk_like_tokenize(txt))
+        lower_toks = [t.lower() for t in tokens]
+        risk_hits = sum(1 for t in lower_toks if t in risk_terms)
+        feats.append([float(len(tokens)), float(risk_hits)])
+    return np.asarray(feats, dtype=np.float32)
+
+
+def find_threshold_for_recall(y_true: np.ndarray, y_proba: np.ndarray, min_recall: float) -> float:
+    """Seleciona o maior limiar que mantém a revocação >= min_recall."""
+    thresholds = np.linspace(0.05, 0.95, 181)
+    valid = [
+        float(th)
+        for th in thresholds
+        if recall_score(y_true, (y_proba >= th).astype(np.int32), zero_division=0) >= min_recall
+    ]
+    if valid:
+        return max(valid)
+    return float(
+        max(
+            thresholds,
+            key=lambda th: recall_score(y_true, (y_proba >= th).astype(np.int32), zero_division=0),
+        )
+    )
+
+
+def main() -> None:
+    cfg = AuditConfig()
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SQL_SCHEMA_SEED)
+
+    # 1. Consulta SQL INNER JOIN da questão
+    pares = conn.execute(
+        """
+        SELECT AUDITOR.Nome AS 'Auditor', AUDITADO.Nome AS 'Auditado'
+        FROM AUDITOR
+        INNER JOIN AUDITADO ON AUDITADO.ID_A = AUDITOR.ID_A;
+        """
+    ).fetchall()
+    print("=== 1. Resultado INNER JOIN (SQLite) ===")
+    for auditor, auditado in pares:
+        print(f"  Auditor={auditor} | Auditado={auditado}")
+
+    # Exemplo de filtragem de stop words (questão NLTK) e sintaxe
+    exemplo_nltk = "Eu sou um analista de dados da CVM!"
+    tokens_filtrados = filter_stopwords_exact(nltk_like_tokenize(exemplo_nltk))
+    print(f"\nExemplo stop words NLTK: {tokens_filtrados}")
+    print(f"Anotação sintática curta: {analyze_syntax_sample(nltk_like_tokenize('O rato roeu a roupa'))[:3]}")
+
+    # 2. Popula tabela de relatos/JSON no SQLite e treina modelo NLP
+    records, texts, y = build_nlp_audit_dataset(seed=42)
+    conn.executemany(
+        """
+        INSERT INTO RELATOS_AUDITORIA (ID_O, PAYLOAD_JSON, TEXTO_RELATO, ROTULO_EXAME)
+        VALUES (?, ?, ?, ?);
+        """,
+        [(r["id_o"], r["payload"], r["texto"], r["rotulo"]) for r in records],
+    )
+    conn.commit()
+
+    x_train_txt, x_temp_txt, y_train, y_temp = train_test_split(
+        texts, y, test_size=0.30, stratify=y, random_state=42
+    )
+    x_val_txt, x_test_txt, y_val, y_test = train_test_split(
+        x_temp_txt, y_temp, test_size=0.50, stratify=y_temp, random_state=42
+    )
+
+    features = FeatureUnion(
+        [
+            ("tfidf", TfidfVectorizer(ngram_range=(1, 2), max_features=200)),
+            ("lexical", FunctionTransformer(lexical_stats_features, validate=False)),
+        ]
+    )
+
+    x_train = features.fit_transform(x_train_txt).toarray()
+    x_val = features.transform(x_val_txt).toarray()
+    x_test = features.transform(x_test_txt).toarray()
+
+    clf = HistGradientBoostingClassifier(max_iter=120, learning_rate=0.06, random_state=42)
+    clf.fit(x_train, y_train)
+
+    val_proba = clf.predict_proba(x_val)[:, 1]
+    best_th = find_threshold_for_recall(y_val, val_proba, cfg.target_recall)
+
+    test_proba = clf.predict_proba(x_test)[:, 1]
+    test_pred = (test_proba >= best_th).astype(np.int32)
+
+    tn, fp, fn, tp = confusion_matrix(y_test, test_pred).ravel()
+    custo = fn * cfg.cost_false_negative + fp * cfg.cost_false_positive
+
+    print(f"\n=== 2. Modelo NLP de Auditoria (threshold={best_th:.2f}) ===")
+    print(
+        f"Revocação (Recall): {recall_score(y_test, test_pred):.4f} | "
+        f"Precisão: {precision_score(y_test, test_pred):.4f} | "
+        f"F1: {f1_score(y_test, test_pred):.4f} | "
+        f"ROC-AUC: {roc_auc_score(y_test, test_proba):.4f}"
+    )
+    print(f"Matriz (VP={tp}, VN={tn}, FP={fp}, FN={fn}) | Custo estimado: R$ {custo:,.2f}")
+    print(
+        classification_report(
+            y_test, test_pred, target_names=["Dispensa (0)", "Exame detalhado (1)"]
+        )
+    )
+
+    # 3. Persiste triagem por auditado no SQLite
+    rows_sql = conn.execute(
+        "SELECT ID_O, PAYLOAD_JSON, TEXTO_RELATO FROM RELATOS_AUDITORIA"
+    ).fetchall()
+    x_all = features.transform([r[2] for r in rows_sql]).toarray()
+    probs_all = clf.predict_proba(x_all)[:, 1]
+    preds_all = (probs_all >= best_th).astype(int)
+
+    conn.executemany(
+        """
+        INSERT INTO TRIAGEM_AUDITORIA (ID_O, EXAME_DETALHADO, PROB_RISCO)
+        VALUES (?, ?, ?);
+        """,
+        [
+            (int(row[0]), int(pred), float(prob))
+            for row, pred, prob in zip(rows_sql, preds_all, probs_all)
+        ],
+    )
+    conn.commit()
+
+    resumo_auditados = conn.execute(
+        """
+        SELECT
+            COALESCE(AUDITOR.Nome, 'Sem auditor') AS Auditor,
+            AUDITADO.Nome AS Auditado,
+            COUNT(TRIAGEM_AUDITORIA.ID_TRIAGEM) AS QtdRelatos,
+            SUM(TRIAGEM_AUDITORIA.EXAME_DETALHADO) AS QtdExameDetalhado,
+            ROUND(AVG(TRIAGEM_AUDITORIA.PROB_RISCO), 4) AS RiscoMedio
+        FROM AUDITADO
+        LEFT JOIN AUDITOR ON AUDITADO.ID_A = AUDITOR.ID_A
+        LEFT JOIN TRIAGEM_AUDITORIA ON TRIAGEM_AUDITORIA.ID_O = AUDITADO.ID_O
+        GROUP BY AUDITADO.ID_O, AUDITADO.Nome, AUDITOR.Nome
+        ORDER BY AUDITADO.ID_O;
+        """
+    ).fetchall()
+
+    print("=== 3. Resumo Consolidado no SQLite por Auditado ===")
+    for auditor, auditado, qtd, qtd_exame, risco_med in resumo_auditados:
+        print(
+            f"  Auditado={auditado} | Auditor={auditor} | "
+            f"Relatos={qtd} | ExameDetalhado={qtd_exame} | RiscoMédio={risco_med:.4f}"
+        )
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+ARQUIVO: inferencia_estimacao.py
+================================================================================
+
+import math
+import numpy as np
+from scipy.stats import chi2, norm, t
+
+
+def q51_poisson_condicional(taxa_15min: float = 1.0) -> float:
+    lam_1h = taxa_15min * 4.0  # 4 denúncias/hora
+    # Usando aproximação e^(-4) = 0.018 do enunciado:
+    exp_minus_4 = 0.018
+    p_ge_2_dado_ge_1 = (1.0 - 5.0 * exp_minus_4) / (1.0 - exp_minus_4)
+    return p_ge_2_dado_ge_1
+
+
+def q52_metodo_momentos(amostra: np.ndarray) -> float:
+    x_bar = float(np.mean(amostra))
+    # E[X] = (theta + 1) / (theta + 2) = x_bar  =>  theta = (1 - 2*x_bar) / (x_bar - 1)
+    return (1.0 - 2.0 * x_bar) / (x_bar - 1.0)
+
+
+def q53_mle_gama_k2(media_amostral: float = 400.0) -> float:
+    # f(x) = theta^2 * x * exp(-theta * x) => theta_hat = 2 / x_bar
+    return 2.0 / media_amostral
+
+
+def q54_ic_variancia_li(n: int = 8, s: float = 8.0, alpha: float = 0.05) -> float:
+    df = n - 1
+    chi2_sup = float(chi2.ppf(1.0 - alpha / 2.0, df=df))
+    return (df * (s**2)) / chi2_sup
+
+
+def q55_teste_t_fii(
+    n: int = 16, x_bar: float = 15.85, mu_0: float = 15.0, s: float = 2.0
+) -> dict[str, float | bool]:
+    df = n - 1
+    t_obs = (x_bar - mu_0) / (s / math.sqrt(n))
+    t_crit_10 = float(t.ppf(0.90, df=df))
+    t_crit_05 = float(t.ppf(0.95, df=df))
+    t_crit_01 = float(t.ppf(0.99, df=df))
+    return {
+        "t_obs": t_obs,
+        "t_crit_10": t_crit_10,
+        "t_crit_05": t_crit_05,
+        "t_crit_01": t_crit_01,
+        "rejeita_10": t_obs > t_crit_10,
+        "rejeita_05": t_obs > t_crit_05,
+        "rejeita_01": t_obs > t_crit_01,
+    }
+
+
+def q56_limiar_media_z(
+    n: int = 16, mu_0: float = 4.0, sigma2: float = 25.0, z_crit: float = -1.28
+) -> float:
+    sigma = math.sqrt(sigma2)
+    return mu_0 + z_crit * (sigma / math.sqrt(n))
+
+
+def main() -> None:
+    print(f"Q51 | P(N>=2 | N>=1) = {q51_poisson_condicional():.6f} (455/491 = {455/491:.6f})")
+    print(f"Q52 | theta_MM       = {q52_metodo_momentos(np.array([0.3, 0.2, 0.6, 0.7, 0.2])):.4f} (-1/3)")
+    print(f"Q53 | theta_MV       = {q53_mle_gama_k2(400.0):.6f} (1/200)")
+    print(f"Q54 | LI IC95%(var)  = {q54_ic_variancia_li():.2f} (~28)")
+    print(f"Q55 | Teste t FII    = {q55_teste_t_fii()}")
+    print(f"Q56 | Limiar x_bar   = {q56_limiar_media_z():.2f}")
+
+
+if __name__ == "__main__":
+    main()
+
